@@ -96,12 +96,6 @@ curl "http://localhost:5040/list_transcripts?source=youtube"
 curl "http://localhost:5040/pop_first_transcript?source=youtube"
 ```
 
-The `youtube` source resolves the supplied URL via yt-dlp (default format
-selector `bestaudio/best`, override with `--format`), pipes the resulting
-direct media URL through ffmpeg, and auto-reconnects on transient stream
-interruptions with capped exponential backoff. The host must be a
-recognised YouTube domain; arbitrary `https://...` URLs are rejected.
-
 ### YouTube authentication ("Sign in to confirm you're not a bot")
 
 YouTube increasingly returns
@@ -116,9 +110,7 @@ policy, not a bug; yt-dlp itself can't bypass it. Pass cookies from a
 logged-in YouTube session using one of these mutually exclusive flags:
 
 ```bash
-# Option A: read cookies straight from your browser (does NOT work
-# reliably on WSL because the Windows browser's cookie store sits
-# outside the WSL filesystem):
+# Option A: read cookies straight from your browser:
 uv run python flask/audio_grabber.py youtube \
     --url https://www.youtube.com/watch?v=EXAMPLE_ID \
     --cookies-from-browser chrome

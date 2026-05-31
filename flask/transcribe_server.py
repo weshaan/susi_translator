@@ -15,21 +15,11 @@ import io
 import os
 from dotenv import load_dotenv
 
-# torch and whisper are imported lazily below — only when we actually need
-# to load local models. This keeps the module importable in environments
-# (and test runs) that delegate to a remote whisper.cpp server, where those
-# heavy deps are not installed.
 
-# Load environment variables from .env file
 load_dotenv()
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helpers for env-var parsing
-# ---------------------------------------------------------------------------
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -41,11 +31,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _env_csv(name: str, default: str) -> list:
     raw = os.getenv(name, default)
     return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-# ---------------------------------------------------------------------------
-# Flask + CORS configuration (env-driven)
-# ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 api = Api(app, version='1.0', title='Transcription API',
@@ -60,28 +45,12 @@ _cors_origins = _env_csv(
 CORS(app, resources={r"/*": {"origins": _cors_origins}})
 logger.info(f"CORS allowed origins: {_cors_origins}")
 
-
-# ---------------------------------------------------------------------------
-# Whisper backend configuration
-# ---------------------------------------------------------------------------
-
 # We either use a local in-code model or access a whisper.cpp server.
 use_whisper_server = _env_bool('WHISPER_SERVER_USE', False)
-
-# Two distinct env vars so a power user can pick a fast model for high load
-# and a smart model for low load without collapsing them onto one variable.
-# Backwards compat: if the legacy single WHISPER_MODEL is set, it is used as
-# the default for both unless the more specific variables are also set.
 _legacy_model = os.getenv('WHISPER_MODEL')
 model_fast_name = os.getenv('WHISPER_MODEL_FAST', _legacy_model or 'small')    # 244M
 model_smart_name = os.getenv('WHISPER_MODEL_SMART', _legacy_model or 'medium')  # 769M
-
-# Detect hardware compatibility. We only need torch when loading local
-# models, so device detection is deferred to the lazy-import branch below.
 device = None
-
-# Whisper.cpp server URL. We expose the BASE URL in env (no path), and append
-# the endpoint path (e.g. /inference) at call time.
 whisper_server = os.getenv('WHISPER_SERVER', 'http://localhost:8007').rstrip('/')
 
 # Models are only loaded when we are NOT using the whisper.cpp server.
@@ -91,18 +60,13 @@ model_smart = None
 if use_whisper_server:
     logger.info(f"Whisper backend: server at {whisper_server}/inference")
 else:
-    # Lazy imports: torch and whisper are heavyweight optional deps. Only
-    # import them when we actually need to load a local model.
-    import torch  # noqa: WPS433  (deferred import is intentional)
-    import whisper  # noqa: WPS433  (deferred import is intentional)
+    import torch 
+    import whisper  
 
     print("TORCH CUDA:", torch.cuda.is_available())
     print("DEVICE COUNT:", torch.cuda.device_count())
     logger.info(f"Hardware detection: using {device}")
 
-    # Download (or load) two whisper models. If the download via the whisper
-    # library is not possible (offline / firewalled), prefer locally stored
-    # models from <script_dir>/models/<name>.pt.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     models_path = os.path.join(script_dir, 'models')
 
@@ -116,41 +80,19 @@ else:
     model_fast = _load_whisper_model(model_fast_name)
     model_smart = _load_whisper_model(model_smart_name)
 
-
-# ---------------------------------------------------------------------------
-# Shared in-memory state
-# ---------------------------------------------------------------------------
-
 # transcripts:  tenant_id -> { chunk_id -> {'transcript': str} }
 transcriptd = {}
-# Single shared lock guarding ALL reads and writes to transcriptd. Must NEVER
-# be `threading.Lock()` re-instantiated inline (that pattern provides no
-# mutual exclusion at all).
 transcripts_lock = threading.Lock()
 
 # FIFO queue of pending audio chunks awaiting transcription.
 audio_stack = queue.Queue()
-
-# Per-source "latest session" registry.
-# Each grabber run calls POST /session?source=<mic|file|url|stdin|youtube> at startup;
-# the server mints a fresh tenant_id (uuid) and remembers it as the latest
-# tenant_id for that source along with a creation timestamp. Read endpoints
-# accept ?source=<name> as a convenience that resolves to the latest active
-# tenant_id for that source, so the user never has to type or remember the
-# uuid in curl commands. Stale sessions (older than SESSION_TTL_SECONDS)
-# are evicted on resolve.
 VALID_SOURCES = {"mic", "file", "url", "stdin", "youtube"}
 latest_session_by_source = {s: None for s in VALID_SOURCES}  # source -> (tenant_id, created_ts) or None
 session_lock = threading.Lock()
-
-# How long a per-source "latest session" pointer remains valid without
-# anyone refreshing it. Two hours by default; matches the transcript TTL.
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', '7200'))
 
 
-# ---------------------------------------------------------------------------
 # Small helpers
-# ---------------------------------------------------------------------------
 
 def _parse_int_arg(args, name: str, default: int = None, required: bool = False) -> int:
     """
@@ -175,11 +117,6 @@ def _chunk_id_int(k):
     Best-effort int() of a chunk_id. Returns ``None`` for keys that cannot
     be interpreted as integers, so callers can defensively skip them
     rather than crashing the endpoint with a 500.
-
-    The worker only ever stores numeric millisecond timestamps as
-    chunk_ids, but the public ``POST /transcribe`` API does not validate
-    that constraint; a misbehaving client can still slip a non-numeric
-    id into ``transcriptd``.
     """
     try:
         return int(k)
@@ -221,11 +158,6 @@ def _resolve_tenant(args, default='0000'):
          source with no active session returns None so the caller can
          short-circuit with an empty response.
       3. Fall back to ``default`` (legacy behaviour).
-
-    Note: a None return for a known source is intentionally
-    indistinguishable from "session expired"; both result in an empty
-    transcript response. If you need a hard 404 for "no session yet",
-    add a separate endpoint rather than overloading this resolver.
     """
     explicit = args.get('tenant_id')
     if explicit:
@@ -280,26 +212,11 @@ def _whisper_server_transcribe(audio_int16: np.ndarray) -> dict:
     response.raise_for_status()
     return response.json()
 
-
-# ---------------------------------------------------------------------------
-# Audio worker
-# ---------------------------------------------------------------------------
-
 def _next_payload():
     """
     Pull the next audio payload from ``audio_stack``, dropping any superseded
     duplicates so we only transcribe the latest version of each
     (tenant_id, chunk_id).
-
-    Concurrency / accounting:
-      - For every entry returned from this function the caller MUST eventually
-        call ``audio_stack.task_done()`` exactly once (typically in a finally
-        block). Entries that this function discards because a newer one is
-        already queued are marked ``task_done()`` here so the queue's
-        unfinished_tasks counter stays correct (``audio_stack.join()`` works).
-      - The internal ``audio_stack.queue`` deque is scanned under
-        ``audio_stack.mutex`` so concurrent ``put``/``get`` cannot mutate it
-        while we iterate.
     """
     tenant_id, chunk_id, audiob64 = audio_stack.get()
     while True:
@@ -321,7 +238,6 @@ def process_audio():
         tenant_id, chunk_id, audiob64 = _next_payload()
         logger.debug(f"Queue length: {audio_stack.qsize()}")
         try:
-            # --- Decode + sanity-check the incoming audio ------------------
             audio_data = base64.b64decode(audiob64)
             audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
 
@@ -334,7 +250,6 @@ def process_audio():
                 logger.warning(f"NaN values in audio array for chunk_id {chunk_id}")
                 continue
 
-            # --- Run transcription via the configured backend --------------
             qsize = audio_stack.qsize()
             if use_whisper_server:
                 # Whisper.cpp server doesn't expose a fast/smart distinction;
@@ -348,14 +263,13 @@ def process_audio():
             else:
                 # Local-model branch: torch was already imported at module
                 # load time when use_whisper_server=False, so this is cheap.
-                import torch  # noqa: WPS433  (already imported above)
+                import torch 
                 model = model_fast if qsize > 20 else model_smart
                 audio_tensor = torch.from_numpy(audio_float32)
                 result = model.transcribe(audio_tensor, temperature=0)
 
             transcript = (result.get('text') or '').strip()
 
-            # --- Validate + store ----------------------------------------
             if is_valid(transcript):
                 logger.info(f"VALID transcript for chunk_id {chunk_id}: {transcript}")
                 with transcripts_lock:
@@ -366,10 +280,7 @@ def process_audio():
 
                     current_transcript = transcripts.get(chunk_id)
                     if current_transcript:
-                        # Same chunk_id already exists: this audio is the
-                        # client's appended/extended version of the prior
-                        # buffer for the same chunk, so overwrite rather
-                        # than concatenate.
+                        # buffer for the same chunk, so overwrite rather than concatenate.
                         current_transcript['transcript'] = transcript
                     else:
                         transcripts[chunk_id] = {'transcript': transcript}
@@ -405,9 +316,6 @@ def is_valid(transcript):
 
 
 # Clean old transcripts: remove all chunks older than two hours and any tenants
-# that become empty as a result. Concurrency-safe: takes the shared
-# transcripts_lock and iterates over a snapshot so concurrent mutation in
-# process_audio cannot raise "dictionary changed size during iteration".
 def clean_old_transcripts():
     current_time_ms = int(time.time() * 1000)
     two_hours_ago_ms = current_time_ms - (2 * 60 * 60 * 1000)
@@ -421,9 +329,7 @@ def clean_old_transcripts():
                 empty_tenants.append(tenant_id)
                 continue
 
-            # Snapshot chunk ids; some chunk_ids may be non-numeric in
-            # principle, so we defensively skip those rather than crashing
-            # the worker thread.
+            # Snapshot chunk ids; some chunk_ids may be non-numeric in principle, so we defensively skip those rather than crashing the worker thread.
             stale_chunks = []
             for chunk_id in list(transcripts.keys()):
                 try:
@@ -442,8 +348,6 @@ def clean_old_transcripts():
         for tenant_id in empty_tenants:
             transcriptd.pop(tenant_id, None)
 
-
-# merge all transcripts into one and split them into sentences
 def merge_and_split_transcripts(transcripts):
     """
     Take a ``{chunk_id: {'transcript': str}}`` mapping and produce a new
@@ -455,10 +359,6 @@ def merge_and_split_transcripts(transcripts):
     last chunk for any trailing fragment). Values are dicts with a
     ``'transcript'`` key so callers can use the same access pattern as
     the underlying ``transcriptd`` store.
-
-    The previous implementation called ``.strip()`` directly on values,
-    which crashed at runtime because values are dicts, not strings; this
-    rewrite handles the dict shape correctly.
     """
     sec = ".!?"
     merged = ""
@@ -499,15 +399,6 @@ def merge_and_split_transcripts(transcripts):
 
     return result
 
-
-# ---------------------------------------------------------------------------
-# Swagger / flask-restx models
-# ---------------------------------------------------------------------------
-
-# NOTE: api.model() registrations must use unique names. The original code
-# used 'Transcript' for both the /transcribe ack and the transcript-payload
-# schema, which made flask-restx silently overwrite the first registration
-# and produce a wrong Swagger doc for /transcribe.
 transcribe_input_model = api.model('Transcribe', {
     'audio_b64': fields.String(required=True, description='Base64 encoded audio data'),
     'chunk_id': fields.String(required=True, description='ID of the audio chunk'),
@@ -930,18 +821,6 @@ class TranscriptsSize(Resource):
         t = {k: v for k, v in t.items() if _in_chunk_range(k, fromid, untilid)}
         return jsonify({'size': len(t)})
 
-
-# ---------------------------------------------------------------------------
-# Audio worker auto-start
-# ---------------------------------------------------------------------------
-# The worker thread MUST be started at module-import time, not in
-# ``if __name__ == '__main__':``. Otherwise running under any WSGI server
-# (gunicorn, uwsgi, ``flask run``) leaves the queue with no consumer and
-# ``POST /transcribe`` requests pile up forever.
-#
-# The TRANSCRIBE_AUTOSTART_WORKER env var is honoured for the test suite,
-# which sets it to "false" so a real worker doesn't try to drain queued
-# items (and call out to whisper.cpp) during ``test_transcribe_*``.
 _worker_thread = None
 _worker_lock = threading.Lock()
 
@@ -966,17 +845,8 @@ if _env_bool('TRANSCRIBE_AUTOSTART_WORKER', True):
     _start_worker_once()
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
 if __name__ == '__main__':
     # Server bind config is env-driven so the defaults are SAFE:
-    #   - host defaults to 127.0.0.1 (loopback only)
-    #   - debug defaults to False (NEVER bind the Werkzeug debugger on a
-    #     network-reachable port; doing so is remote-code-execution).
-    # Override via FLASK_HOST / FLASK_PORT / FLASK_DEBUG when you really
-    # mean it (e.g. inside a private VM you fully control).
     host = os.getenv('FLASK_HOST', '127.0.0.1')
     port = int(os.getenv('FLASK_PORT', '5040'))
     debug = _env_bool('FLASK_DEBUG', False)
@@ -989,7 +859,5 @@ if __name__ == '__main__':
             host,
         )
 
-    # use_reloader=False because the audio-worker thread above must not be
-    # spawned twice (the reloader runs the module twice, which would
-    # otherwise create a duplicate consumer on the queue).
+    # use_reloader=False because the audio-worker thread above must not be spawned twice (the reloader runs the module twice, which would otherwise create a duplicate consumer on the queue).
     app.run(host=host, port=port, debug=debug, use_reloader=False)
