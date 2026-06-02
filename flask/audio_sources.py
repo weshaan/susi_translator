@@ -288,7 +288,10 @@ class URLSource(AudioSource):
             "-ar", str(self.SAMPLE_RATE),
             "-",  # write to stdout
         ]
-        self._proc = subprocess.Popen(  
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        # Safe: self._url is validated by _validate_url() (scheme whitelist,
+        # no leading '-', host required); argv is a fixed list with shell=False.
+        self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -466,7 +469,11 @@ class YouTubeSource(AudioSource):
         ydl_argv = self._build_ydl_argv()
         ff_argv = self._build_ffmpeg_argv()
 
-        self._ydl_proc = subprocess.Popen( 
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        # Safe: URL validated by _validate_url() (YouTube host whitelist, no
+        # leading '-'); argv built from fixed flags with '--' before the URL,
+        # shell=False.
+        self._ydl_proc = subprocess.Popen(
             ydl_argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -475,7 +482,10 @@ class YouTubeSource(AudioSource):
         )
 
         try:
-            self._ffmpeg_proc = subprocess.Popen(  
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            # Safe: fixed argv, input is the local yt-dlp pipe, pipe-only
+            # protocol whitelist, shell=False.
+            self._ffmpeg_proc = subprocess.Popen(
                 ff_argv,
                 stdin=self._ydl_proc.stdout,
                 stdout=subprocess.PIPE,
