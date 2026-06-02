@@ -63,8 +63,8 @@ else:
     import torch 
     import whisper  
 
-    print("TORCH CUDA:", torch.cuda.is_available())
-    print("DEVICE COUNT:", torch.cuda.device_count())
+    logger.info("TORCH CUDA: %s", torch.cuda.is_available())
+    logger.info("DEVICE COUNT: %s", torch.cuda.device_count())
     logger.info(f"Hardware detection: using {device}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
