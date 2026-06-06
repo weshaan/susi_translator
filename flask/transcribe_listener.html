@@ -68,7 +68,7 @@ limitations under the License.
     function getLatestTranscript() {
       const serverhost = document.getElementById('serverhost').value;
       const serverport = document.getElementById('serverport').value;
-      const get_latest_transcript_url = `http://${serverhost}:${serverport}/get_latest_transcript?sentences=true`;
+      const get_latest_transcript_url = `http://${serverhost}:${serverport}/transcripts/latest?sentences=true`;
       fetch(get_latest_transcript_url)
         .then(response => response.json())
         .then(data => {

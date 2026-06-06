@@ -413,7 +413,7 @@ disable_toc: true
             };
 
             // construct the URL from the host and port
-            const transcribeurl = `/api/transcribe`;
+            const transcribeurl = `/api/transcripts`;
             const csrftoken = getCookie('csrftoken');
             fetch(transcribeurl, {
                 method: 'POST',

@@ -215,7 +215,7 @@ uv run python manage.py runserver 0.0.0.0:5040
 
 #### Testing the API Endpoints
 - Use tools like curl or Postman to test the API endpoints.
-- For example, to test the transcribe endpoint:
+- For example, to submit an audio chunk for transcription:
 ```
-curl -X POST http://localhost:5040/transcribe -H "Content-Type: application/json" -d '{"tenant_id": "test_tenant", "chunk_id": "12345", "audio": "base64-encoded-audio-data"}'
+curl -X POST http://localhost:5040/api/transcripts -H "Content-Type: application/json" -d '{"tenant_id": "test_tenant", "chunk_id": "12345", "audio_b64": "base64-encoded-audio-data"}'
 ```

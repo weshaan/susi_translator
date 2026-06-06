@@ -3,7 +3,7 @@ SUSI Translator audio grabber
 
 Reads audio from one of five sources (microphone, file, URL, stdin,
 YouTube), buffers up to ~10 seconds while resetting on silence, and POSTs
-base64-encoded chunks to the transcription server's ``/transcribe``
+base64-encoded chunks to the transcription server's ``/transcripts``
 endpoint.
 
 System requirements
@@ -17,8 +17,8 @@ System requirements
 
 To fetch transcripts, curl with ``?source=<name>`` 
 
-    curl "http://localhost:5040/list_transcripts?source=mic"
-    curl "http://localhost:5040/pop_first_transcript?source=youtube"
+    curl "http://localhost:5040/transcripts?source=mic"
+    curl -X DELETE "http://localhost:5040/transcripts/first?source=youtube"
 
 ``--tenant <id>`` is still accepted as an explicit
 override (e.g. for reconnecting to a known session id).
@@ -103,7 +103,7 @@ class TranscribeUploader:
     """
 
     def __init__(self, server: str, tenant_id: str) -> None:
-        self._url: str = server.rstrip("/") + "/transcribe"
+        self._url: str = server.rstrip("/") + "/transcripts"
         self._tenant_id: str = tenant_id
         self._session: requests.Session = _build_session()
 
@@ -122,7 +122,9 @@ class TranscribeUploader:
                 headers={"Content-Type": "application/json"},
                 timeout=30,
             )
-            if response.status_code == 200:
+            # New REST endpoint returns 202 Accepted (transcription is async);
+            # older servers returned 200. Treat both as success.
+            if response.status_code in (200, 202):
                 print(f"Sent chunk {chunk_id} with {len(buffer)} bytes")
             else:
                 print(
@@ -151,7 +153,8 @@ def _register_session(server: str, source: str) -> str:
     url = server.rstrip("/") + "/session"
     try:
         response = requests.post(url, json={"source": source}, timeout=10)
-        if response.status_code == 200:
+        # /session returns 201 Created on the REST server; older servers returned 200. Accept both.
+        if response.status_code in (200, 201):
             payload = response.json()
             tenant_id = payload.get("tenant_id")
             if tenant_id:
@@ -174,7 +177,7 @@ def run(source: AudioSource, server: str, tenant_id: str) -> None:
     """
     Drive one of the ``AudioSource`` implementations: read PCM in
     ~1-second chunks, apply silence-based buffering, and upload each
-    running buffer to ``/transcribe``.
+    running buffer to ``/transcripts``.
     """
     uploader = TranscribeUploader(server=server, tenant_id=tenant_id)
     buffer = bytearray()
@@ -358,11 +361,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  tenant_id: {tenant_id}")
     print(f"  server:    {args.server}")
     if registered:
-        print(f"  curl:      curl \"{args.server.rstrip('/')}"
-              f"/pop_first_transcript?source={args.source}\"")
+        print(f"  curl:      curl -X DELETE \"{args.server.rstrip('/')}"
+              f"/transcripts/first?source={args.source}\"")
     else:
-        print(f"  curl:      curl \"{args.server.rstrip('/')}"
-              f"/pop_first_transcript?tenant_id={tenant_id}\"")
+        print(f"  curl:      curl -X DELETE \"{args.server.rstrip('/')}"
+              f"/transcripts/first?tenant_id={tenant_id}\"")
     print("=" * 60)
 
     run(source=source, server=args.server, tenant_id=tenant_id)

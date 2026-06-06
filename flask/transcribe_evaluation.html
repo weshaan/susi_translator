@@ -43,7 +43,7 @@
 
             function queryAPI() {
                 const inputText = document.getElementById('textField').value;
-                fetch('http://localhost:5040/list_transcripts?sentences=true')
+                fetch('http://localhost:5040/transcripts?sentences=true')
                     .then(response => response.json())
                     .then(data => {
                         let combinedText = Object.values(data).map(entry => entry.transcript).join(' ') + ' ' + inputText;

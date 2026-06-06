@@ -68,7 +68,7 @@ Flask backend bind / safety:
 The grabber under `flask/audio_grabber.py` captures audio from one of five
 sources and streams it to the transcription server. Each source runs
 client-side; the server only ever receives already-decoded base64 PCM via
-`POST /transcribe`.
+`POST /transcripts`.
 
 | Source    | Backend                 | Extra requirements                |
 | --------- | ----------------------- | --------------------------------- |
@@ -92,8 +92,8 @@ ffmpeg -i input.wav -f s16le -ac 1 -ar 16000 - | \
 Read the resulting transcripts back via `?source=<name>`:
 
 ```bash
-curl "http://localhost:5040/list_transcripts?source=youtube"
-curl "http://localhost:5040/pop_first_transcript?source=youtube"
+curl "http://localhost:5040/transcripts?source=youtube"
+curl -X DELETE "http://localhost:5040/transcripts/first?source=youtube"
 ```
 
 ### YouTube authentication ("Sign in to confirm you're not a bot")
@@ -146,5 +146,7 @@ do not download or load multi-hundred-megabyte whisper models. They exercise:
 - `_next_payload` queue dedup with correct `task_done()` accounting
 - `clean_old_transcripts` (stale chunks, empty tenants, non-numeric ids)
 - `_resolve_tenant` including session TTL expiry
-- Flask test_client integration for `/session`, `/transcribe`, `/list_transcripts`,
-  `/get_transcript`, `/transcripts_size` (including malformed input -> 400 not 500).
+- Flask test_client integration for `/session`, `/transcripts`,
+  `/transcripts/{chunk_id}`, `/transcripts/first`, `/transcripts/latest`,
+  `/transcripts/count` (including malformed input -> 400 not 500), plus the
+  deprecated RPC-style aliases.

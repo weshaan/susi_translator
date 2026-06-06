@@ -209,7 +209,7 @@ limitations under the License.
                 // construct the URL from the host and port
                 const serverhost = document.getElementById('serverhost').value;
                 const serverport = document.getElementById('serverport').value;
-                const transcribeurl = `http://${serverhost}:${serverport}/transcribe`;
+                const transcribeurl = `http://${serverhost}:${serverport}/transcripts`;
 
                 // Get CSRF token only when Django backend is selected.
                 // Flask does not use CSRF tokens so the header is skipped.

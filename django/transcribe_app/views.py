@@ -35,20 +35,59 @@ threading.Thread(target=process_audio).start()
 def home(request):
     return HttpResponse("Welcome to the Transcription API!")
 
+
+def _list_transcripts_response(request):
+    """
+    Shared GET /transcripts list logic for both the REST ListTranscriptsView and the legacy TranscribeView. Returns all transcripts for a tenant_id filtered by the from/until chunk_id range. Optionally merges and splits into sentences if ?sentences=true is passed.
+    """
+    tenant_id = request.GET.get('tenant_id', '0000')
+    fromid = request.GET.get('from', '0')
+    untilid = request.GET.get('until', str(int(time.time() * 1000)))
+    sentences = request.GET.get('sentences', 'false') == 'true'
+    t = get_transcripts(tenant_id)
+    if sentences:
+        t = merge_and_split_transcripts(t)
+    transcripts = {k: v for k, v in t.items() if int(fromid) <= int(k) <= int(untilid)}
+    return Response({'transcripts': [{'chunk_id': k, 'transcript': v['transcript']} for k, v in transcripts.items()]})
+
+
+def _delete_transcript_response(request, chunk_id=None):
+    """
+    Shared delete logic for DELETE /transcripts/<chunk_id> and the legacy delete_transcript endpoint.
+    """
+    tenant_id = request.GET.get('tenant_id', '0000')
+    chunk_id = _resolve_chunk_id(request, chunk_id)
+    sentences = request.GET.get('sentences', 'false') == 'true'
+    t = get_transcripts(tenant_id)
+    if sentences:
+        t = merge_and_split_transcripts(t)
+    if chunk_id in t:
+        entry = t.pop(chunk_id)
+        return Response({'chunk_id': chunk_id, 'transcript': entry['transcript']})
+    return Response({'chunk_id': chunk_id, 'transcript': ''})
+
+
+def _resolve_chunk_id(request, chunk_id=None):
+    """
+    Resolve the target chunk_id from either the REST path segment (``/transcripts/<int:chunk_id>``) or the legacy ``?chunk_id=`` query parameter. 
+    """
+    if chunk_id is None:
+        chunk_id = request.GET.get('chunk_id')
+    return None if chunk_id is None else str(chunk_id)
+
+
 @method_decorator(csrf_exempt, name='dispatch')
 class TranscribeView(APIView):
     parser_classes = [JSONParser]
 
+    # When wired to the legacy /transcribe path we keep the historical 200 response; the new REST route POST /api/transcripts returns 202 Accepted because transcription is asynchronous.
+    legacy = False
+
     @swagger_auto_schema(
         request_body=TranscribeInputSerializer,
-        responses={200: TranscribeResponseSerializer}
+        responses={202: TranscribeResponseSerializer}
     )
     def post(self, request):
-        """
-        The /transcribe endpoint expects JSON objects with base64-encoded audio binaries.
-        Each chunk should have a unique chunk_id.
-        The server processes each chunk and transcribes the audio using Whisper.
-        """
         serializer = TranscribeInputSerializer(data=request.data)
         if serializer.is_valid():
             data = serializer.validated_data
@@ -58,26 +97,38 @@ class TranscribeView(APIView):
             audio_b64 = data['audio_b64']
             chunk_id = data['chunk_id']
             add_to_audio_stack(tenant_id, chunk_id, audio_b64, translate_from, translate_to)
-            #print("queue length: " + str(audio_stack.qsize()))
             logger.debug(f"Received chunk {chunk_id} with tenant_id {tenant_id}")
             response_data = {'chunk_id': chunk_id, 'tenant_id': tenant_id, 'status': 'processing'}
-            #print("received chunk " + chunk_id + " with " + str(len(audio_b64)) + " bytes")
-            return Response(response_data, status=status.HTTP_200_OK)
+            success = status.HTTP_200_OK if self.legacy else status.HTTP_202_ACCEPTED
+            return Response(response_data, status=success)
         else:
             logger.error("Invalid data in TranscribeView")
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter('tenant_id', openapi.IN_QUERY, description="Tenant ID", type=openapi.TYPE_STRING, default='0000'),
+            openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
+            openapi.Parameter('from', openapi.IN_QUERY, description="Starting chunk ID", type=openapi.TYPE_STRING, default='0'),
+            openapi.Parameter('until', openapi.IN_QUERY, description="End chunk ID", type=openapi.TYPE_STRING, default=str(int(time.time() * 1000))),
+        ],
+        responses={200: ListTranscriptsResponseSerializer}
+    )
+    def get(self, request):
+        """List all transcripts for a tenant, filtered by the from/until chunk range."""
+        return _list_transcripts_response(request)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class GetTranscriptView(APIView):
     @swagger_auto_schema(
         manual_parameters=[
             openapi.Parameter('tenant_id', openapi.IN_QUERY, description="Tenant ID", type=openapi.TYPE_STRING, default='0000'),
-            openapi.Parameter('chunk_id', openapi.IN_QUERY, description="Chunk ID", type=openapi.TYPE_STRING),
+            openapi.Parameter('chunk_id', openapi.IN_QUERY, description="Chunk ID (legacy; prefer the /transcripts/{chunk_id} path)", type=openapi.TYPE_STRING),
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
         ],
         responses={200: TranscriptResponseSerializer}
     )
-    def get(self, request):
+    def get(self, request, chunk_id=None):
         """
         Retrieve the transcript for a given chunk_id.
         If the chunk_id is not found, an empty transcript is returned.
@@ -89,12 +140,24 @@ class GetTranscriptView(APIView):
         else:
             sentences = request.GET.get('sentences', 'false') == 'true'
             if sentences: t = merge_and_split_transcripts(t)
-            chunk_id = request.GET.get('chunk_id')
+            chunk_id = _resolve_chunk_id(request, chunk_id)
             if chunk_id in t:
                 transcript = t.get(chunk_id, {}).get('transcript', '')
                 return Response({'chunk_id': chunk_id, 'transcript': transcript})
             else:
                 return Response({'chunk_id': chunk_id, 'transcript': ''})
+
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter('tenant_id', openapi.IN_QUERY, description="Tenant ID", type=openapi.TYPE_STRING, default='0000'),
+        ],
+        responses={200: TranscriptResponseSerializer}
+    )
+    def delete(self, request, chunk_id=None):
+        """
+        Delete the transcript for a specific chunk_id.
+        """
+        return _delete_transcript_response(request, chunk_id)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class GetFirstTranscriptView(APIView):
@@ -133,10 +196,24 @@ class PopFirstTranscriptView(APIView):
         ],
         responses={200: TranscriptResponseSerializer}
     )
-    def get(self, request):
+    def delete(self, request):
         """
         Retrieve and remove the first transcript for a given tenant_id.
+
+        DELETE is the canonical method for this destructive operation.
         """
+        return self._pop_first(request)
+
+    def get(self, request):
+        """
+        DEPRECATED: use DELETE /api/transcripts/first instead. GET on a
+        destructive endpoint violates the HTTP "GET is safe" contract.
+        Kept for backward compatibility.
+        """
+        logger.warning("Deprecated GET pop_first_transcript called; use DELETE /api/transcripts/first.")
+        return self._pop_first(request)
+
+    def _pop_first(self, request):
         tenant_id = request.GET.get('tenant_id', '0000')
         t = get_transcripts(tenant_id)
         if len(t) == 0:
@@ -199,10 +276,24 @@ class PopLatestTranscriptView(APIView):
         ],
         responses={200: TranscriptResponseSerializer}
     )
-    def get(self, request):
+    def delete(self, request):
         """
         Retrieve and remove the latest transcript for a given tenant_id.
+
+        DELETE is the canonical method for this destructive operation.
         """
+        return self._pop_latest(request)
+
+    def get(self, request):
+        """
+        DEPRECATED: use DELETE /api/transcripts/latest instead. GET on a
+        destructive endpoint violates the HTTP "GET is safe" contract.
+        Kept for backward compatibility.
+        """
+        logger.warning("Deprecated GET pop_latest_transcript called; use DELETE /api/transcripts/latest.")
+        return self._pop_latest(request)
+
+    def _pop_latest(self, request):
         tenant_id = request.GET.get('tenant_id', '0000')
         untilid = request.GET.get('until', str(int(time.time() * 1000)))
         sentences = request.GET.get('sentences', 'false') == 'true'
@@ -221,25 +312,30 @@ class DeleteTranscriptView(APIView):
     @swagger_auto_schema(
         manual_parameters=[
             openapi.Parameter('tenant_id', openapi.IN_QUERY, description="Tenant ID", type=openapi.TYPE_STRING, default='0000'),
-            openapi.Parameter('chunk_id', openapi.IN_QUERY, description="Chunk ID", type=openapi.TYPE_STRING),
+            openapi.Parameter('chunk_id', openapi.IN_QUERY, description="Chunk ID (legacy; prefer the /transcripts/{chunk_id} path)", type=openapi.TYPE_STRING),
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
         ],
         responses={200: TranscriptResponseSerializer}
     )
-    def get(self, request):
+    def delete(self, request, chunk_id=None):
         """
         Delete a transcript for a given tenant_id and chunk_id.
+
+        DELETE is the canonical method for this destructive operation.
         """
-        tenant_id = request.GET.get('tenant_id', '0000')
-        chunk_id = request.GET.get('chunk_id')
-        sentences = request.GET.get('sentences', 'false') == 'true'
-        t = get_transcripts(tenant_id)
-        if sentences: t = merge_and_split_transcripts(t)
-        if chunk_id in t:
-            entry = t.pop(chunk_id)
-            return Response({'chunk_id': chunk_id, 'transcript': entry['transcript']})
-        else:
-            return Response({'chunk_id': chunk_id, 'transcript': ''})
+        return self._delete(request, chunk_id)
+
+    def get(self, request, chunk_id=None):
+        """
+        DEPRECATED: use DELETE /api/transcripts/{chunk_id} instead. GET on a
+        destructive endpoint violates the HTTP "GET is safe" contract.
+        Kept for backward compatibility.
+        """
+        logger.warning("Deprecated GET delete_transcript called; use DELETE /api/transcripts/{chunk_id}.")
+        return self._delete(request, chunk_id)
+
+    def _delete(self, request, chunk_id=None):
+        return _delete_transcript_response(request, chunk_id)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class ListTranscriptsView(APIView):
@@ -256,14 +352,7 @@ class ListTranscriptsView(APIView):
         """
         List all transcripts for a given tenant_id.
         """
-        tenant_id = request.GET.get('tenant_id', '0000')
-        fromid = request.GET.get('from', '0')
-        untilid = request.GET.get('until', str(int(time.time() * 1000)))
-        sentences = request.GET.get('sentences', 'false') == 'true'
-        t = get_transcripts(tenant_id)
-        if sentences: t = merge_and_split_transcripts(t)
-        transcripts = {k: v for k, v in t.items() if int(fromid) <= int(k) <= int(untilid)}
-        return Response({'transcripts': [{'chunk_id': k, 'transcript': v['transcript']} for k, v in transcripts.items()]})
+        return _list_transcripts_response(request)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class TranscriptsSizeView(APIView):

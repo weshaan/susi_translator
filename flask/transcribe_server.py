@@ -438,388 +438,418 @@ session_response_model = api.model('SessionResponse', {
 })
 
 
+
+# Shared Swagger parameter blocks (referenced by the REST resources below).
+_TENANT_PARAM = {'description': 'Tenant ID', 'default': '0000'}
+_SOURCE_PARAM = {
+    'description': 'Resolve to the latest session for a source (mic|file|url|stdin|youtube). '
+                   'Ignored if tenant_id is given. Unknown values return HTTP 400.',
+    'type': 'string',
+    'enum': ['mic', 'file', 'url', 'stdin', 'youtube'],
+}
+_SENTENCES_PARAM = {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False}
+_FROM_PARAM = {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'}
+_UNTIL_PARAM = {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
+
+_EMPTY_TRANSCRIPT = {'chunk_id': '-1', 'transcript': ''}
+
+
+def _wants_sentences() -> bool:
+    return request.args.get('sentences', default='false').strip().lower() == 'true'
+
+
+def _session_logic(success_status: int = 201):
+    data = request.get_json(force=True, silent=True) or {}
+    source = data.get('source') or request.args.get('source')
+    if source not in VALID_SOURCES:
+        return {"error": f"source must be one of {sorted(VALID_SOURCES)}"}, 400
+
+    new_tenant_id = uuid.uuid4().hex
+    with session_lock:
+        latest_session_by_source[source] = (new_tenant_id, time.time())
+
+    logger.info(f"New session for source={source}: tenant_id={new_tenant_id}")
+    return {"tenant_id": new_tenant_id, "source": source}, success_status
+
+
+def _transcribe_logic(success_status: int = 202):
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return {"error": "No JSON payload received"}, 400
+
+    audio_b64 = data.get('audio_b64')
+    chunk_id = data.get('chunk_id')
+    tenant_id = data.get('tenant_id', '0000')
+
+    if not audio_b64 or not chunk_id:
+        return {"error": "Missing required fields"}, 400
+
+    # push to processing queue
+    audio_stack.put((tenant_id, chunk_id, audio_b64))
+    return {"chunk_id": chunk_id, "tenant_id": tenant_id, "status": "processing"}, success_status
+
+
+def _get_transcript_logic(chunk_id):
+    tenant_id = _resolve_tenant(request.args)
+    with transcripts_lock:
+        t = dict(transcriptd.get(tenant_id, {}))
+    if len(t) == 0:
+        return dict(_EMPTY_TRANSCRIPT)
+    if _wants_sentences():
+        t = merge_and_split_transcripts(t)
+    chunk_id = None if chunk_id is None else str(chunk_id)
+    if chunk_id in t:
+        return {'chunk_id': chunk_id, 'transcript': t[chunk_id]['transcript']}
+    return {'chunk_id': chunk_id, 'transcript': ''}
+
+
+def _first_transcript_logic():
+    tenant_id = _resolve_tenant(request.args)
+    with transcripts_lock:
+        t = dict(transcriptd.get(tenant_id, {}))
+    if len(t) == 0:
+        return dict(_EMPTY_TRANSCRIPT)
+    if _wants_sentences():
+        t = merge_and_split_transcripts(t)
+    fromid = _parse_int_arg(request.args, 'from', default=0)
+    first_chunk_id = next(
+        (k for k in _numeric_sorted_keys(t) if _chunk_id_int(k) >= fromid),
+        None,
+    )
+    if first_chunk_id is None:
+        return dict(_EMPTY_TRANSCRIPT)
+    return {'chunk_id': first_chunk_id, 'transcript': t[first_chunk_id]['transcript']}
+
+
+def _pop_first_logic():
+    tenant_id = _resolve_tenant(request.args)
+    sentences = _wants_sentences()
+    fromid = _parse_int_arg(request.args, 'from', default=0)
+
+    with transcripts_lock:
+        stored = transcriptd.get(tenant_id)
+        if not stored:
+            return dict(_EMPTY_TRANSCRIPT)
+
+        view = merge_and_split_transcripts(stored) if sentences else stored
+        first_chunk_id = next(
+            (k for k in _numeric_sorted_keys(view) if _chunk_id_int(k) >= fromid),
+            None,
+        )
+        if first_chunk_id is None:
+            return dict(_EMPTY_TRANSCRIPT)
+
+        entry = stored.pop(first_chunk_id, None)
+        if sentences:
+            first_transcript = view[first_chunk_id]['transcript']
+        else:
+            first_transcript = entry['transcript'] if entry else ''
+    return {'chunk_id': first_chunk_id, 'transcript': first_transcript}
+
+
+def _latest_transcript_logic():
+    tenant_id = _resolve_tenant(request.args)
+    with transcripts_lock:
+        t = dict(transcriptd.get(tenant_id, {}))
+    if len(t) == 0:
+        return dict(_EMPTY_TRANSCRIPT)
+    if _wants_sentences():
+        t = merge_and_split_transcripts(t)
+    untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
+    latest_chunk_id = next(
+        (k for k in _numeric_sorted_keys(t, reverse=True) if _chunk_id_int(k) < untilid),
+        None,
+    )
+    if latest_chunk_id is None:
+        return dict(_EMPTY_TRANSCRIPT)
+    return {'chunk_id': latest_chunk_id, 'transcript': t[latest_chunk_id]['transcript']}
+
+
+def _pop_latest_logic():
+    tenant_id = _resolve_tenant(request.args)
+    sentences = _wants_sentences()
+    untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
+
+    with transcripts_lock:
+        stored = transcriptd.get(tenant_id)
+        if not stored:
+            return dict(_EMPTY_TRANSCRIPT)
+
+        view = merge_and_split_transcripts(stored) if sentences else stored
+        latest_chunk_id = next(
+            (k for k in _numeric_sorted_keys(view, reverse=True) if _chunk_id_int(k) < untilid),
+            None,
+        )
+        if latest_chunk_id is None:
+            return dict(_EMPTY_TRANSCRIPT)
+
+        entry = stored.pop(latest_chunk_id, None)
+        if sentences:
+            latest_transcript = view[latest_chunk_id]['transcript']
+        else:
+            latest_transcript = entry['transcript'] if entry else ''
+    return {'chunk_id': latest_chunk_id, 'transcript': latest_transcript}
+
+
+def _delete_transcript_logic(chunk_id):
+    tenant_id = _resolve_tenant(request.args)
+    chunk_id = None if chunk_id is None else str(chunk_id)
+    with transcripts_lock:
+        stored = transcriptd.get(tenant_id, {})
+        if chunk_id in stored:
+            entry = stored.pop(chunk_id, None)
+            return {'chunk_id': chunk_id, 'transcript': entry['transcript']}
+    return {'chunk_id': chunk_id, 'transcript': ''}
+
+
+def _list_transcripts_logic():
+    tenant_id = _resolve_tenant(request.args)
+    sentences = _wants_sentences()
+    fromid = _parse_int_arg(request.args, 'from', default=0)
+    untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
+    with transcripts_lock:
+        t = dict(transcriptd.get(tenant_id, {}))
+    if sentences:
+        t = merge_and_split_transcripts(t)
+    return {k: v for k, v in t.items() if _in_chunk_range(k, fromid, untilid)}
+
+
+def _transcripts_size_logic():
+    tenant_id = _resolve_tenant(request.args)
+    sentences = _wants_sentences()
+    fromid = _parse_int_arg(request.args, 'from', default=0)
+    untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
+    with transcripts_lock:
+        t = dict(transcriptd.get(tenant_id, {}))
+    if sentences:
+        t = merge_and_split_transcripts(t)
+    t = {k: v for k, v in t.items() if _in_chunk_range(k, fromid, untilid)}
+    return {'size': len(t)}
+
+
 @api.route('/session')
 class Session(Resource):
     @api.expect(session_input_model)
-    @api.response(200, 'Success', session_response_model)
+    @api.response(201, 'Created', session_response_model)
     @api.response(400, 'Invalid source')
     def post(self):
-        '''
-        Start a new transcription session for an input source.
-
-        The grabber calls this once per run, passing its source name
-        (mic/file/url/stdin/youtube). The server mints a fresh tenant_id
-        (uuid) and records it as the latest session for that source.
-        Subsequent read requests using ?source=<name> resolve to this
-        tenant_id, so the user never has to know or type the uuid.
-        '''
         try:
-            data = request.get_json(force=True, silent=True) or {}
-            source = data.get('source') or request.args.get('source')
-            if source not in VALID_SOURCES:
-                return {
-                    "error": f"source must be one of {sorted(VALID_SOURCES)}",
-                }, 400
-
-            new_tenant_id = uuid.uuid4().hex
-            with session_lock:
-                latest_session_by_source[source] = (new_tenant_id, time.time())
-
-            logger.info(f"New session for source={source}: tenant_id={new_tenant_id}")
-            return {"tenant_id": new_tenant_id, "source": source}, 200
+            return _session_logic(success_status=201)
         except HTTPException:
             raise
         except Exception as e:
-            logger.error("Error in /session", exc_info=True)
+            logger.error("Error in POST /session", exc_info=True)
             return {"error": str(e)}, 500
 
 
-@api.route('/transcribe')
-class Transcribe(Resource):
+@api.route('/transcripts')
+class Transcripts(Resource):
     @api.expect(transcribe_input_model)
-    @api.response(200, 'Success', transcribe_response_model)
-    @api.response(404, 'Transcript Not Found')
+    @api.response(202, 'Accepted', transcribe_response_model)
+    @api.response(400, 'Bad Request')
     def post(self):
+        '''
+        Submit an audio chunk for transcription.
+        Transcription is asynchronous: Poll GET /transcripts (or the first/latest/<id>
+        sub-resources) to retrieve results.
+        '''
         try:
-            # `silent=True` makes get_json() return None on a malformed body
-            # instead of raising werkzeug.BadRequest. We then translate the
-            # missing/invalid body into a clean 400 ourselves rather than
-            # letting the broad `except Exception` below convert it into 500.
-            data = request.get_json(force=True, silent=True)
-
-            if not data:
-                return {"error": "No JSON payload received"}, 400
-
-            audio_b64 = data.get('audio_b64')
-            chunk_id = data.get('chunk_id')
-            tenant_id = data.get('tenant_id', '0000')
-
-            if not audio_b64 or not chunk_id:
-                return {"error": "Missing required fields"}, 400
-
-            # push to processing queue
-            audio_stack.put((tenant_id, chunk_id, audio_b64))
-
-            response_data = {
-                "chunk_id": chunk_id,
-                "tenant_id": tenant_id,
-                "status": "processing"
-            }
-
-            return response_data, 200
-
+            return _transcribe_logic(success_status=202)
         except HTTPException:
-            # Let abort()/HTTPException-derived errors keep their status code.
             raise
         except Exception as e:
-            logger.error("Error in /transcribe", exc_info=True)
+            logger.error("Error in POST /transcripts", exc_info=True)
             return {"error": str(e)}, 500
 
-@api.route('/get_transcript')
-class GetTranscript(Resource):
     @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'chunk_id' : {'description': 'Chunk ID'},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.response(404, 'Transcript Not Found')
-    def get(self):
-        '''
-        The /get_transcript endpoint allows clients to retrieve the transcript for a given chunk_id.
-        If the chunk_id is not found, an empty transcript is returned.
-        '''
-        tenant_id = _resolve_tenant(request.args)
-        with transcripts_lock:
-            t = dict(transcriptd.get(tenant_id, {}))
-        if len(t) == 0:
-            return jsonify({'chunk_id': '-1', 'transcript': ''})
-        else:
-            sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-            if sentences: t = merge_and_split_transcripts(t)
-            chunk_id = request.args.get('chunk_id')
-            if chunk_id in t:
-                return jsonify({'chunk_id': chunk_id, 'transcript': t[chunk_id]['transcript']})
-            else:
-                return jsonify({'chunk_id': chunk_id, 'transcript': ''})
-
-@api.route('/get_first_transcript')
-class GetFirstTranscript(Resource):
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'from'     : {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.response(404, 'Transcript Not Found')
-    def get(self):
-        '''
-        Get first transcript endpoint: Retrieve the first transcript for a given tenant_id
-        '''
-        tenant_id = _resolve_tenant(request.args)
-        with transcripts_lock:
-            t = dict(transcriptd.get(tenant_id, {}))
-        if len(t) == 0:
-            return jsonify({'chunk_id': '-1', 'transcript': ''})
-        else:
-            sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-            if sentences: t = merge_and_split_transcripts(t)
-            fromid = _parse_int_arg(request.args, 'from', default=0)
-            first_chunk_id = next(
-                (k for k in _numeric_sorted_keys(t) if _chunk_id_int(k) >= fromid),
-                None,
-            )
-            if first_chunk_id is None:
-                return jsonify({'chunk_id': '-1', 'transcript': ''})
-            first_transcript = t[first_chunk_id]['transcript']
-            return jsonify({'chunk_id': first_chunk_id, 'transcript': first_transcript})
-
-@api.route('/pop_first_transcript')
-class PopFirstTranscript(Resource):
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'from'     : {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.response(404, 'Transcript Not Found')
-    def delete(self):
-        '''
-        Pop first transcript: retrieve and remove the first transcript for a given tenant_id.
-
-        DELETE is the canonical method for this destructive operation.
-        '''
-        return self._pop_first()
-
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'from'     : {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.deprecated
-    def get(self):
-        '''
-        DEPRECATED: use DELETE /pop_first_transcript instead. GET on a
-        destructive endpoint violates the HTTP "GET is safe" contract and
-        is incompatible with caching proxies. Kept for backward compat.
-        '''
-        logger.warning("Deprecated GET /pop_first_transcript called; use DELETE.")
-        return self._pop_first()
-
-    def _pop_first(self):
-        tenant_id = _resolve_tenant(request.args)
-        sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-        fromid = _parse_int_arg(request.args, 'from', default=0)
-
-        with transcripts_lock:
-            stored = transcriptd.get(tenant_id)
-            if not stored:
-                return jsonify({'chunk_id': '-1', 'transcript': ''})
-
-            view = merge_and_split_transcripts(stored) if sentences else stored
-            first_chunk_id = next(
-                (k for k in _numeric_sorted_keys(view) if _chunk_id_int(k) >= fromid),
-                None,
-            )
-            if first_chunk_id is None:
-                return jsonify({'chunk_id': '-1', 'transcript': ''})
-
-            entry = stored.pop(first_chunk_id, None)
-            if sentences:
-                first_transcript = view[first_chunk_id]['transcript']
-            else:
-                first_transcript = entry['transcript'] if entry else ''
-        return jsonify({'chunk_id': first_chunk_id, 'transcript': first_transcript})
-
-@api.route('/get_latest_transcript')
-class GetLatestTranscript(Resource):
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'until': {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.response(404, 'Transcript Not Found')
-    def get(self):
-        '''
-        Get latest transcript endpoint: Retrieve the latest transcript for a given tenant_id
-        '''
-        tenant_id = _resolve_tenant(request.args)
-        with transcripts_lock:
-            t = dict(transcriptd.get(tenant_id, {}))
-        if len(t) == 0:
-            return jsonify({'chunk_id': '-1', 'transcript': ''})
-        else:
-            sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-            if sentences: t = merge_and_split_transcripts(t)
-            untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
-            latest_chunk_id = next(
-                (k for k in _numeric_sorted_keys(t, reverse=True) if _chunk_id_int(k) < untilid),
-                None,
-            )
-            if latest_chunk_id is None:
-                return jsonify({'chunk_id': '-1', 'transcript': ''})
-            latest_transcript = t[latest_chunk_id]['transcript']
-            return jsonify({'chunk_id': latest_chunk_id, 'transcript': latest_transcript})
-
-@api.route('/pop_latest_transcript')
-class PopLatestTranscript(Resource):
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'until': {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.response(404, 'Transcript Not Found')
-    def delete(self):
-        '''
-        Pop latest transcript: retrieve and remove the latest transcript for a given tenant_id.
-
-        DELETE is the canonical method for this destructive operation.
-        '''
-        return self._pop_latest()
-
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'until': {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.deprecated
-    def get(self):
-        '''
-        DEPRECATED: use DELETE /pop_latest_transcript instead. GET on a
-        destructive endpoint violates the HTTP "GET is safe" contract and
-        is incompatible with caching proxies. Kept for backward compat.
-        '''
-        logger.warning("Deprecated GET /pop_latest_transcript called; use DELETE.")
-        return self._pop_latest()
-
-    def _pop_latest(self):
-        tenant_id = _resolve_tenant(request.args)
-        sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-        untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
-
-        with transcripts_lock:
-            stored = transcriptd.get(tenant_id)
-            if not stored:
-                return jsonify({'chunk_id': '-1', 'transcript': ''})
-
-            view = merge_and_split_transcripts(stored) if sentences else stored
-            latest_chunk_id = next(
-                (k for k in _numeric_sorted_keys(view, reverse=True) if _chunk_id_int(k) < untilid),
-                None,
-            )
-            if latest_chunk_id is None:
-                return jsonify({'chunk_id': '-1', 'transcript': ''})
-
-            entry = stored.pop(latest_chunk_id, None)
-            if sentences:
-                latest_transcript = view[latest_chunk_id]['transcript']
-            else:
-                latest_transcript = entry['transcript'] if entry else ''
-        return jsonify({'chunk_id': latest_chunk_id, 'transcript': latest_transcript})
-
-@api.route('/delete_transcript')
-class DeleteTranscript(Resource):
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'chunk_id' : {'description': 'Chunk ID', 'type': 'string'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.response(404, 'Transcript Not Found')
-    def delete(self):
-        '''
-        Delete a transcript for a given tenant_id and chunk_id.
-
-        DELETE is the canonical method for this destructive operation.
-        '''
-        return self._delete()
-
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'chunk_id' : {'description': 'Chunk ID', 'type': 'string'}
-    })
-    @api.response(200, 'Success', transcript_response_model)
-    @api.deprecated
-    def get(self):
-        '''
-        DEPRECATED: use DELETE /delete_transcript instead. GET on a
-        destructive endpoint violates the HTTP "GET is safe" contract and
-        is incompatible with caching proxies. Kept for backward compat.
-        '''
-        logger.warning("Deprecated GET /delete_transcript called; use DELETE.")
-        return self._delete()
-
-    def _delete(self):
-        tenant_id = _resolve_tenant(request.args)
-        chunk_id = request.args.get('chunk_id')
-        with transcripts_lock:
-            stored = transcriptd.get(tenant_id, {})
-            if chunk_id in stored:
-                entry = stored.pop(chunk_id, None)
-                return jsonify({'chunk_id': chunk_id, 'transcript': entry['transcript']})
-        return jsonify({'chunk_id': chunk_id, 'transcript': ''})
-
-@api.route('/list_transcripts')
-class ListTranscripts(Resource):
-    @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'from'     : {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'},
-        'until'    : {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+        'from': _FROM_PARAM,
+        'until': _UNTIL_PARAM,
     })
     @api.response(200, 'Success', list_transcripts_response_model)
-    @api.response(404, 'Transcript Not Found')
     def get(self):
-        '''
-        list all transcripts for a given tenant_id
-        '''
-        tenant_id = _resolve_tenant(request.args)
-        sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-        fromid = _parse_int_arg(request.args, 'from', default=0)
-        untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
-        with transcripts_lock:
-            t = dict(transcriptd.get(tenant_id, {}))
-        if sentences: t = merge_and_split_transcripts(t)
-        result = {k: v for k, v in t.items() if _in_chunk_range(k, fromid, untilid)}
-        return jsonify(result)
+        '''List all transcripts for a tenant, filtered by the from/until chunk range.'''
+        return jsonify(_list_transcripts_logic())
 
-@api.route('/transcripts_size')
-class TranscriptsSize(Resource):
+
+@api.route('/transcripts/count')
+class TranscriptsCount(Resource):
     @api.doc(params={
-        'tenant_id': {'description': 'Tenant ID', 'default': '0000'},
-        'source':    {'description': 'Resolve to the latest session for a source (mic|file|url|stdin). Ignored if tenant_id is given. Unknown values return HTTP 400.', 'type': 'string', 'enum': ['mic', 'file', 'url', 'stdin', 'youtube']},
-        'sentences': {'description': 'Merge and split transcripts into sentences', 'type': 'boolean', 'default': False},
-        'from'     : {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'},
-        'until'    : {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+        'from': _FROM_PARAM,
+        'until': _UNTIL_PARAM,
     })
     @api.response(200, 'Success', size_response_model)
-    @api.response(404, 'Transcript Not Found')
     def get(self):
-        '''
-        get the size of the transcripts for a given tenant_id
-        '''
-        tenant_id = _resolve_tenant(request.args)
-        sentences = request.args.get('sentences', default='false').strip().lower() == 'true'
-        fromid = _parse_int_arg(request.args, 'from', default=0)
-        untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
-        with transcripts_lock:
-            t = dict(transcriptd.get(tenant_id, {}))
-        if sentences: t = merge_and_split_transcripts(t)
-        t = {k: v for k, v in t.items() if _in_chunk_range(k, fromid, untilid)}
-        return jsonify({'size': len(t)})
+        '''Get the number of transcripts for a tenant (within the from/until range).'''
+        return jsonify(_transcripts_size_logic())
+
+
+@api.route('/transcripts/first')
+class TranscriptsFirst(Resource):
+    @api.doc(params={
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+        'from': _FROM_PARAM,
+    })
+    @api.response(200, 'Success', transcript_response_model)
+    def get(self):
+        '''Retrieve the first transcript for a tenant (non-destructive).'''
+        return jsonify(_first_transcript_logic())
+
+    @api.doc(params={
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+        'from': _FROM_PARAM,
+    })
+    @api.response(200, 'Success', transcript_response_model)
+    def delete(self):
+        '''Retrieve and remove (pop) the first transcript for a tenant.'''
+        return jsonify(_pop_first_logic())
+
+
+@api.route('/transcripts/latest')
+class TranscriptsLatest(Resource):
+    @api.doc(params={
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+        'until': _UNTIL_PARAM,
+    })
+    @api.response(200, 'Success', transcript_response_model)
+    def get(self):
+        '''Retrieve the latest transcript for a tenant (non-destructive).'''
+        return jsonify(_latest_transcript_logic())
+
+    @api.doc(params={
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+        'until': _UNTIL_PARAM,
+    })
+    @api.response(200, 'Success', transcript_response_model)
+    def delete(self):
+        '''Retrieve and remove (pop) the latest transcript for a tenant.'''
+        return jsonify(_pop_latest_logic())
+
+
+@api.route('/transcripts/<int:chunk_id>')
+class TranscriptByID(Resource):
+    # chunk_ids are millisecond timestamps, so the <int:...> converter both validates the path segment and guarantees it can never shadow the static /transcripts/first|latest|count routes above.
+    @api.doc(params={
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+        'sentences': _SENTENCES_PARAM,
+    })
+    @api.response(200, 'Success', transcript_response_model)
+    def get(self, chunk_id):
+        '''Retrieve the transcript for a specific chunk_id.'''
+        return jsonify(_get_transcript_logic(chunk_id))
+
+    @api.doc(params={
+        'tenant_id': _TENANT_PARAM,
+        'source': _SOURCE_PARAM,
+    })
+    @api.response(200, 'Success', transcript_response_model)
+    def delete(self, chunk_id):
+        '''Delete the transcript for a specific chunk_id.'''
+        return jsonify(_delete_transcript_logic(chunk_id))
+
+
+# Deprecated RPC-style aliases.
+# Kept for one release so existing clients (older grabbers, bookmarked curls,
+# the HTML pages) don't break the moment this merges. Hidden from Swagger via
+# doc=False to keep the published API surface clean. 
+@api.route('/transcribe', doc=False)
+class TranscribeLegacy(Resource):
+    def post(self):
+        '''DEPRECATED: use POST /transcripts.'''
+        logger.warning("Deprecated POST /transcribe called; use POST /transcripts.")
+        try:
+            return _transcribe_logic(success_status=200)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Error in /transcribe (deprecated)", exc_info=True)
+            return {"error": str(e)}, 500
+
+
+@api.route('/list_transcripts', doc=False)
+class ListTranscriptsLegacy(Resource):
+    def get(self):
+        '''DEPRECATED: use GET /transcripts.'''
+        return jsonify(_list_transcripts_logic())
+
+
+@api.route('/transcripts_size', doc=False)
+class TranscriptsSizeLegacy(Resource):
+    def get(self):
+        '''DEPRECATED: use GET /transcripts/count.'''
+        return jsonify(_transcripts_size_logic())
+
+
+@api.route('/get_transcript', doc=False)
+class GetTranscriptLegacy(Resource):
+    def get(self):
+        '''DEPRECATED: use GET /transcripts/<chunk_id>.'''
+        return jsonify(_get_transcript_logic(request.args.get('chunk_id')))
+
+
+@api.route('/get_first_transcript', doc=False)
+class GetFirstTranscriptLegacy(Resource):
+    def get(self):
+        '''DEPRECATED: use GET /transcripts/first.'''
+        return jsonify(_first_transcript_logic())
+
+
+@api.route('/pop_first_transcript', doc=False)
+class PopFirstTranscriptLegacy(Resource):
+    def delete(self):
+        '''DEPRECATED: use DELETE /transcripts/first.'''
+        return jsonify(_pop_first_logic())
+
+    def get(self):
+        '''DEPRECATED (and destructive): use DELETE /transcripts/first.'''
+        logger.warning("Deprecated GET /pop_first_transcript called; use DELETE /transcripts/first.")
+        return jsonify(_pop_first_logic())
+
+
+@api.route('/get_latest_transcript', doc=False)
+class GetLatestTranscriptLegacy(Resource):
+    def get(self):
+        '''DEPRECATED: use GET /transcripts/latest.'''
+        return jsonify(_latest_transcript_logic())
+
+
+@api.route('/pop_latest_transcript', doc=False)
+class PopLatestTranscriptLegacy(Resource):
+    def delete(self):
+        '''DEPRECATED: use DELETE /transcripts/latest.'''
+        return jsonify(_pop_latest_logic())
+
+    def get(self):
+        '''DEPRECATED (and destructive): use DELETE /transcripts/latest.'''
+        logger.warning("Deprecated GET /pop_latest_transcript called; use DELETE /transcripts/latest.")
+        return jsonify(_pop_latest_logic())
+
+
+@api.route('/delete_transcript', doc=False)
+class DeleteTranscriptLegacy(Resource):
+    def delete(self):
+        '''DEPRECATED: use DELETE /transcripts/<chunk_id>.'''
+        return jsonify(_delete_transcript_logic(request.args.get('chunk_id')))
+
+    def get(self):
+        '''DEPRECATED (and destructive): use DELETE /transcripts/<chunk_id>.'''
+        logger.warning("Deprecated GET /delete_transcript called; use DELETE /transcripts/<chunk_id>.")
+        return jsonify(_delete_transcript_logic(request.args.get('chunk_id')))
+
 
 _worker_thread = None
 _worker_lock = threading.Lock()
