@@ -52,9 +52,6 @@ def _list_transcripts_response(request):
 
 
 def _delete_transcript_response(request, chunk_id=None):
-    """
-    Shared delete logic for DELETE /transcripts/<chunk_id> and the legacy delete_transcript endpoint.
-    """
     tenant_id = request.GET.get('tenant_id', '0000')
     chunk_id = _resolve_chunk_id(request, chunk_id)
     sentences = request.GET.get('sentences', 'false') == 'true'
@@ -64,7 +61,7 @@ def _delete_transcript_response(request, chunk_id=None):
     if chunk_id in t:
         entry = t.pop(chunk_id)
         return Response({'chunk_id': chunk_id, 'transcript': entry['transcript']})
-    return Response({'chunk_id': chunk_id, 'transcript': ''})
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 def _resolve_chunk_id(request, chunk_id=None):
@@ -126,32 +123,28 @@ class GetTranscriptView(APIView):
             openapi.Parameter('chunk_id', openapi.IN_QUERY, description="Chunk ID (legacy; prefer the /transcripts/{chunk_id} path)", type=openapi.TYPE_STRING),
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
         ],
-        responses={200: TranscriptResponseSerializer}
+        responses={200: TranscriptResponseSerializer, 404: 'Transcript not found'}
     )
     def get(self, request, chunk_id=None):
-        """
-        Retrieve the transcript for a given chunk_id.
-        If the chunk_id is not found, an empty transcript is returned.
-        """
         tenant_id = request.GET.get('tenant_id', '0000')
         t = get_transcripts(tenant_id)
-        if len(t) == 0:
-            return Response({'chunk_id': '-1', 'transcript': ''})
-        else:
+        chunk_id = _resolve_chunk_id(request, chunk_id)
+        if len(t) != 0:
             sentences = request.GET.get('sentences', 'false') == 'true'
             if sentences: t = merge_and_split_transcripts(t)
-            chunk_id = _resolve_chunk_id(request, chunk_id)
             if chunk_id in t:
                 transcript = t.get(chunk_id, {}).get('transcript', '')
                 return Response({'chunk_id': chunk_id, 'transcript': transcript})
-            else:
-                return Response({'chunk_id': chunk_id, 'transcript': ''})
+        return Response(
+            {'error': 'Transcript not found', 'chunk_id': chunk_id},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
     @swagger_auto_schema(
         manual_parameters=[
             openapi.Parameter('tenant_id', openapi.IN_QUERY, description="Tenant ID", type=openapi.TYPE_STRING, default='0000'),
         ],
-        responses={200: TranscriptResponseSerializer}
+        responses={200: TranscriptResponseSerializer, 204: 'Nothing to delete (chunk_id not present)'}
     )
     def delete(self, request, chunk_id=None):
         """
@@ -167,24 +160,22 @@ class GetFirstTranscriptView(APIView):
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
             openapi.Parameter('from', openapi.IN_QUERY, description="Starting chunk ID", type=openapi.TYPE_STRING, default='0'),
         ],
-        responses={200: TranscriptResponseSerializer}
+        responses={200: TranscriptResponseSerializer, 204: 'No transcripts available'}
     )
     def get(self, request):
-        """
-        Retrieve the first transcript for a given tenant_id.
-        """
         tenant_id = request.GET.get('tenant_id', '0000')
         t = get_transcripts(tenant_id)
         if len(t) == 0:
-            return Response({'chunk_id': '-1', 'transcript': ''})
-        else:
-            sentences = request.GET.get('sentences', 'false') == 'true'
-            if sentences: t = merge_and_split_transcripts(t)
-            fromid = request.GET.get('from', '0')
-            sorted_keys = sorted(t.keys())
-            first_chunk_id = next((k for k in sorted_keys if int(k) >= int(fromid)), None)
-            first_transcript = t[first_chunk_id]['transcript']
-            return Response({'chunk_id': first_chunk_id, 'transcript': first_transcript})
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        sentences = request.GET.get('sentences', 'false') == 'true'
+        if sentences: t = merge_and_split_transcripts(t)
+        fromid = request.GET.get('from', '0')
+        sorted_keys = sorted(t.keys())
+        first_chunk_id = next((k for k in sorted_keys if int(k) >= int(fromid)), None)
+        if first_chunk_id is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        first_transcript = t[first_chunk_id]['transcript']
+        return Response({'chunk_id': first_chunk_id, 'transcript': first_transcript})
 
 @method_decorator(csrf_exempt, name='dispatch')
 class PopFirstTranscriptView(APIView):
@@ -194,7 +185,7 @@ class PopFirstTranscriptView(APIView):
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
             openapi.Parameter('from', openapi.IN_QUERY, description="Starting chunk ID", type=openapi.TYPE_STRING, default='0'),
         ],
-        responses={200: TranscriptResponseSerializer}
+        responses={200: TranscriptResponseSerializer, 204: 'No transcripts available'}
     )
     def delete(self, request):
         """
@@ -217,15 +208,16 @@ class PopFirstTranscriptView(APIView):
         tenant_id = request.GET.get('tenant_id', '0000')
         t = get_transcripts(tenant_id)
         if len(t) == 0:
-            return Response({'chunk_id': '-1', 'transcript': ''})
-        else:
-            sentences = request.GET.get('sentences', 'false') == 'true'
-            if sentences: t = merge_and_split_transcripts(t)
-            fromid = request.GET.get('from', '0')
-            sorted_keys = sorted(t.keys())
-            first_chunk_id = next((k for k in sorted_keys if int(k) >= int(fromid)), None)
-            first_transcript = t.pop(first_chunk_id, {}).get('transcript', '')
-            return Response({'chunk_id': first_chunk_id, 'transcript': first_transcript})
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        sentences = request.GET.get('sentences', 'false') == 'true'
+        if sentences: t = merge_and_split_transcripts(t)
+        fromid = request.GET.get('from', '0')
+        sorted_keys = sorted(t.keys())
+        first_chunk_id = next((k for k in sorted_keys if int(k) >= int(fromid)), None)
+        if first_chunk_id is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        first_transcript = t.pop(first_chunk_id, {}).get('transcript', '')
+        return Response({'chunk_id': first_chunk_id, 'transcript': first_transcript})
 
 @method_decorator(csrf_exempt, name='dispatch')
 class GetLatestTranscriptView(APIView):
@@ -274,14 +266,9 @@ class PopLatestTranscriptView(APIView):
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
             openapi.Parameter('until', openapi.IN_QUERY, description="End chunk ID", type=openapi.TYPE_STRING, default=str(int(time.time() * 1000))),
         ],
-        responses={200: TranscriptResponseSerializer}
+        responses={200: TranscriptResponseSerializer, 204: 'No transcripts available'}
     )
     def delete(self, request):
-        """
-        Retrieve and remove the latest transcript for a given tenant_id.
-
-        DELETE is the canonical method for this destructive operation.
-        """
         return self._pop_latest(request)
 
     def get(self, request):
@@ -304,8 +291,7 @@ class PopLatestTranscriptView(APIView):
         if latest_chunk_id in t:
             latest_transcript = t.pop(latest_chunk_id, {}).get('transcript', '')
             return Response({'chunk_id': latest_chunk_id, 'transcript': latest_transcript})
-        else:
-            return Response({'chunk_id': '-1', 'transcript': ''})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class DeleteTranscriptView(APIView):
@@ -315,14 +301,9 @@ class DeleteTranscriptView(APIView):
             openapi.Parameter('chunk_id', openapi.IN_QUERY, description="Chunk ID (legacy; prefer the /transcripts/{chunk_id} path)", type=openapi.TYPE_STRING),
             openapi.Parameter('sentences', openapi.IN_QUERY, description="Merge and split transcripts into sentences", type=openapi.TYPE_BOOLEAN, default=False),
         ],
-        responses={200: TranscriptResponseSerializer}
+        responses={200: TranscriptResponseSerializer, 204: 'Nothing to delete (chunk_id not present)'}
     )
     def delete(self, request, chunk_id=None):
-        """
-        Delete a transcript for a given tenant_id and chunk_id.
-
-        DELETE is the canonical method for this destructive operation.
-        """
         return self._delete(request, chunk_id)
 
     def get(self, request, chunk_id=None):

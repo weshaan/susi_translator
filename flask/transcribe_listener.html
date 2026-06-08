@@ -70,14 +70,19 @@ limitations under the License.
       const serverport = document.getElementById('serverport').value;
       const get_latest_transcript_url = `http://${serverhost}:${serverport}/transcripts/latest?sentences=true`;
       fetch(get_latest_transcript_url)
-        .then(response => response.json())
+        .then(response => {
+        
+          if (response.status === 204 || response.status === 404) return null;
+          return response.json();
+        })
         .then(data => {
+          if (!data) return;
           // Backward Compatibility Check
           if (data.chunk_id !== undefined) {
             // 1. Legacy Flask Server Format
             const chunkId = String(data.chunk_id);
             const transcript = data.transcript || "";
-            if (chunkId === "-1" || !transcript.trim()) return;
+            if (!transcript.trim()) return;
 
             if (chunkId !== latestChunkId) {
               const newLine = document.createElement('div');

@@ -451,8 +451,6 @@ _SENTENCES_PARAM = {'description': 'Merge and split transcripts into sentences',
 _FROM_PARAM = {'description': 'Starting chunk ID', 'type': 'string', 'default': '0'}
 _UNTIL_PARAM = {'description': 'End chunk ID (defaults to "now" in ms)', 'type': 'string'}
 
-_EMPTY_TRANSCRIPT = {'chunk_id': '-1', 'transcript': ''}
-
 
 def _wants_sentences() -> bool:
     return request.args.get('sentences', default='false').strip().lower() == 'true'
@@ -491,24 +489,23 @@ def _transcribe_logic(success_status: int = 202):
 
 def _get_transcript_logic(chunk_id):
     tenant_id = _resolve_tenant(request.args)
+    chunk_id = None if chunk_id is None else str(chunk_id)
     with transcripts_lock:
         t = dict(transcriptd.get(tenant_id, {}))
-    if len(t) == 0:
-        return dict(_EMPTY_TRANSCRIPT)
     if _wants_sentences():
         t = merge_and_split_transcripts(t)
-    chunk_id = None if chunk_id is None else str(chunk_id)
     if chunk_id in t:
-        return {'chunk_id': chunk_id, 'transcript': t[chunk_id]['transcript']}
-    return {'chunk_id': chunk_id, 'transcript': ''}
+        return {'chunk_id': chunk_id, 'transcript': t[chunk_id]['transcript']}, 200
+    return {'error': 'Transcript not found', 'chunk_id': chunk_id}, 404
 
 
 def _first_transcript_logic():
+   
     tenant_id = _resolve_tenant(request.args)
     with transcripts_lock:
         t = dict(transcriptd.get(tenant_id, {}))
-    if len(t) == 0:
-        return dict(_EMPTY_TRANSCRIPT)
+    if not t:
+        return '', 204
     if _wants_sentences():
         t = merge_and_split_transcripts(t)
     fromid = _parse_int_arg(request.args, 'from', default=0)
@@ -517,8 +514,8 @@ def _first_transcript_logic():
         None,
     )
     if first_chunk_id is None:
-        return dict(_EMPTY_TRANSCRIPT)
-    return {'chunk_id': first_chunk_id, 'transcript': t[first_chunk_id]['transcript']}
+        return '', 204
+    return {'chunk_id': first_chunk_id, 'transcript': t[first_chunk_id]['transcript']}, 200
 
 
 def _pop_first_logic():
@@ -529,7 +526,7 @@ def _pop_first_logic():
     with transcripts_lock:
         stored = transcriptd.get(tenant_id)
         if not stored:
-            return dict(_EMPTY_TRANSCRIPT)
+            return '', 204
 
         view = merge_and_split_transcripts(stored) if sentences else stored
         first_chunk_id = next(
@@ -537,22 +534,22 @@ def _pop_first_logic():
             None,
         )
         if first_chunk_id is None:
-            return dict(_EMPTY_TRANSCRIPT)
+            return '', 204
 
         entry = stored.pop(first_chunk_id, None)
         if sentences:
             first_transcript = view[first_chunk_id]['transcript']
         else:
             first_transcript = entry['transcript'] if entry else ''
-    return {'chunk_id': first_chunk_id, 'transcript': first_transcript}
+    return {'chunk_id': first_chunk_id, 'transcript': first_transcript}, 200
 
 
 def _latest_transcript_logic():
     tenant_id = _resolve_tenant(request.args)
     with transcripts_lock:
         t = dict(transcriptd.get(tenant_id, {}))
-    if len(t) == 0:
-        return dict(_EMPTY_TRANSCRIPT)
+    if not t:
+        return '', 204
     if _wants_sentences():
         t = merge_and_split_transcripts(t)
     untilid = _parse_int_arg(request.args, 'until', default=int(time.time() * 1000))
@@ -561,8 +558,8 @@ def _latest_transcript_logic():
         None,
     )
     if latest_chunk_id is None:
-        return dict(_EMPTY_TRANSCRIPT)
-    return {'chunk_id': latest_chunk_id, 'transcript': t[latest_chunk_id]['transcript']}
+        return '', 204
+    return {'chunk_id': latest_chunk_id, 'transcript': t[latest_chunk_id]['transcript']}, 200
 
 
 def _pop_latest_logic():
@@ -573,7 +570,7 @@ def _pop_latest_logic():
     with transcripts_lock:
         stored = transcriptd.get(tenant_id)
         if not stored:
-            return dict(_EMPTY_TRANSCRIPT)
+            return '', 204
 
         view = merge_and_split_transcripts(stored) if sentences else stored
         latest_chunk_id = next(
@@ -581,14 +578,14 @@ def _pop_latest_logic():
             None,
         )
         if latest_chunk_id is None:
-            return dict(_EMPTY_TRANSCRIPT)
+            return '', 204
 
         entry = stored.pop(latest_chunk_id, None)
         if sentences:
             latest_transcript = view[latest_chunk_id]['transcript']
         else:
             latest_transcript = entry['transcript'] if entry else ''
-    return {'chunk_id': latest_chunk_id, 'transcript': latest_transcript}
+    return {'chunk_id': latest_chunk_id, 'transcript': latest_transcript}, 200
 
 
 def _delete_transcript_logic(chunk_id):
@@ -598,8 +595,8 @@ def _delete_transcript_logic(chunk_id):
         stored = transcriptd.get(tenant_id, {})
         if chunk_id in stored:
             entry = stored.pop(chunk_id, None)
-            return {'chunk_id': chunk_id, 'transcript': entry['transcript']}
-    return {'chunk_id': chunk_id, 'transcript': ''}
+            return {'chunk_id': chunk_id, 'transcript': entry['transcript']}, 200
+    return '', 204
 
 
 def _list_transcripts_logic():
@@ -698,9 +695,11 @@ class TranscriptsFirst(Resource):
         'from': _FROM_PARAM,
     })
     @api.response(200, 'Success', transcript_response_model)
+    @api.response(204, 'No transcripts available')
     def get(self):
         '''Retrieve the first transcript for a tenant (non-destructive).'''
-        return jsonify(_first_transcript_logic())
+        body, status_code = _first_transcript_logic()
+        return body, status_code
 
     @api.doc(params={
         'tenant_id': _TENANT_PARAM,
@@ -709,9 +708,11 @@ class TranscriptsFirst(Resource):
         'from': _FROM_PARAM,
     })
     @api.response(200, 'Success', transcript_response_model)
+    @api.response(204, 'No transcripts available')
     def delete(self):
         '''Retrieve and remove (pop) the first transcript for a tenant.'''
-        return jsonify(_pop_first_logic())
+        body, status_code = _pop_first_logic()
+        return body, status_code
 
 
 @api.route('/transcripts/latest')
@@ -723,9 +724,11 @@ class TranscriptsLatest(Resource):
         'until': _UNTIL_PARAM,
     })
     @api.response(200, 'Success', transcript_response_model)
+    @api.response(204, 'No transcripts available')
     def get(self):
         '''Retrieve the latest transcript for a tenant (non-destructive).'''
-        return jsonify(_latest_transcript_logic())
+        body, status_code = _latest_transcript_logic()
+        return body, status_code
 
     @api.doc(params={
         'tenant_id': _TENANT_PARAM,
@@ -734,9 +737,11 @@ class TranscriptsLatest(Resource):
         'until': _UNTIL_PARAM,
     })
     @api.response(200, 'Success', transcript_response_model)
+    @api.response(204, 'No transcripts available')
     def delete(self):
         '''Retrieve and remove (pop) the latest transcript for a tenant.'''
-        return jsonify(_pop_latest_logic())
+        body, status_code = _pop_latest_logic()
+        return body, status_code
 
 
 @api.route('/transcripts/<int:chunk_id>')
@@ -748,18 +753,22 @@ class TranscriptByID(Resource):
         'sentences': _SENTENCES_PARAM,
     })
     @api.response(200, 'Success', transcript_response_model)
+    @api.response(404, 'Transcript not found')
     def get(self, chunk_id):
         '''Retrieve the transcript for a specific chunk_id.'''
-        return jsonify(_get_transcript_logic(chunk_id))
+        body, status_code = _get_transcript_logic(chunk_id)
+        return body, status_code
 
     @api.doc(params={
         'tenant_id': _TENANT_PARAM,
         'source': _SOURCE_PARAM,
     })
     @api.response(200, 'Success', transcript_response_model)
+    @api.response(204, 'Nothing to delete (chunk_id not present)')
     def delete(self, chunk_id):
-        '''Delete the transcript for a specific chunk_id.'''
-        return jsonify(_delete_transcript_logic(chunk_id))
+        '''Delete the transcript for a specific chunk_id (idempotent).'''
+        body, status_code = _delete_transcript_logic(chunk_id)
+        return body, status_code
 
 
 # Deprecated RPC-style aliases.
@@ -798,57 +807,66 @@ class TranscriptsSizeLegacy(Resource):
 class GetTranscriptLegacy(Resource):
     def get(self):
         '''DEPRECATED: use GET /transcripts/<chunk_id>.'''
-        return jsonify(_get_transcript_logic(request.args.get('chunk_id')))
+        body, status_code = _get_transcript_logic(request.args.get('chunk_id'))
+        return body, status_code
 
 
 @api.route('/get_first_transcript', doc=False)
 class GetFirstTranscriptLegacy(Resource):
     def get(self):
         '''DEPRECATED: use GET /transcripts/first.'''
-        return jsonify(_first_transcript_logic())
+        body, status_code = _first_transcript_logic()
+        return body, status_code
 
 
 @api.route('/pop_first_transcript', doc=False)
 class PopFirstTranscriptLegacy(Resource):
     def delete(self):
         '''DEPRECATED: use DELETE /transcripts/first.'''
-        return jsonify(_pop_first_logic())
+        body, status_code = _pop_first_logic()
+        return body, status_code
 
     def get(self):
         '''DEPRECATED (and destructive): use DELETE /transcripts/first.'''
         logger.warning("Deprecated GET /pop_first_transcript called; use DELETE /transcripts/first.")
-        return jsonify(_pop_first_logic())
+        body, status_code = _pop_first_logic()
+        return body, status_code
 
 
 @api.route('/get_latest_transcript', doc=False)
 class GetLatestTranscriptLegacy(Resource):
     def get(self):
         '''DEPRECATED: use GET /transcripts/latest.'''
-        return jsonify(_latest_transcript_logic())
+        body, status_code = _latest_transcript_logic()
+        return body, status_code
 
 
 @api.route('/pop_latest_transcript', doc=False)
 class PopLatestTranscriptLegacy(Resource):
     def delete(self):
         '''DEPRECATED: use DELETE /transcripts/latest.'''
-        return jsonify(_pop_latest_logic())
+        body, status_code = _pop_latest_logic()
+        return body, status_code
 
     def get(self):
         '''DEPRECATED (and destructive): use DELETE /transcripts/latest.'''
         logger.warning("Deprecated GET /pop_latest_transcript called; use DELETE /transcripts/latest.")
-        return jsonify(_pop_latest_logic())
+        body, status_code = _pop_latest_logic()
+        return body, status_code
 
 
 @api.route('/delete_transcript', doc=False)
 class DeleteTranscriptLegacy(Resource):
     def delete(self):
         '''DEPRECATED: use DELETE /transcripts/<chunk_id>.'''
-        return jsonify(_delete_transcript_logic(request.args.get('chunk_id')))
+        body, status_code = _delete_transcript_logic(request.args.get('chunk_id'))
+        return body, status_code
 
     def get(self):
         '''DEPRECATED (and destructive): use DELETE /transcripts/<chunk_id>.'''
         logger.warning("Deprecated GET /delete_transcript called; use DELETE /transcripts/<chunk_id>.")
-        return jsonify(_delete_transcript_logic(request.args.get('chunk_id')))
+        body, status_code = _delete_transcript_logic(request.args.get('chunk_id'))
+        return body, status_code
 
 
 _worker_thread = None

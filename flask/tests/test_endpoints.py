@@ -95,11 +95,11 @@ def test_list_transcripts_rejects_non_integer_from(client, ts):
     assert resp.status_code == 400
 
 
-def test_get_transcript_returns_empty_when_no_session(client):
+def test_get_transcript_returns_404_when_no_session(client):
     resp = client.get("/transcripts/123?source=mic")
-    assert resp.status_code == 200
+    assert resp.status_code == 404
     body = resp.get_json()
-    assert body == {"chunk_id": "-1", "transcript": ""}
+    assert body == {"error": "Transcript not found", "chunk_id": "123"}
 
 
 def test_get_transcript_rejects_unknown_source(client):
@@ -114,6 +114,16 @@ def test_get_transcript_finds_seeded_entry(client, ts):
     assert resp.get_json() == {"chunk_id": "42", "transcript": "hello world"}
 
 
+def test_get_transcript_returns_404_for_missing_chunk(client, ts):
+    _seed(ts, "t1", {"42": "hello world"})
+    resp = client.get("/transcripts/99999999?tenant_id=t1")
+    assert resp.status_code == 404
+    assert resp.get_json() == {
+        "error": "Transcript not found",
+        "chunk_id": "99999999",
+    }
+
+
 def test_delete_transcript_removes_entry(client, ts):
     _seed(ts, "t1", {"42": "hello world", "43": "keep me"})
     resp = client.delete("/transcripts/42?tenant_id=t1")
@@ -125,11 +135,58 @@ def test_delete_transcript_removes_entry(client, ts):
     assert remaining == {"43"}
 
 
+def test_delete_transcript_returns_204_when_chunk_absent(client, ts):
+    _seed(ts, "t1", {"42": "hello world"})
+    resp = client.delete("/transcripts/99999999?tenant_id=t1")
+    assert resp.status_code == 204
+    assert resp.data == b""
+    # The seeded chunk must remain untouched.
+    with ts.transcripts_lock:
+        remaining = set(ts.transcriptd["t1"].keys())
+    assert remaining == {"42"}
+
+
+def test_delete_transcript_returns_204_when_tenant_empty(client):
+    resp = client.delete("/transcripts/42?tenant_id=does-not-exist")
+    assert resp.status_code == 204
+    assert resp.data == b""
+
+
+def test_delete_transcript_is_idempotent(client, ts):
+    _seed(ts, "t1", {"42": "hello"})
+    # First delete: 200 with body.
+    resp = client.delete("/transcripts/42?tenant_id=t1")
+    assert resp.status_code == 200
+    # Second delete of the same id: 204 No Content (no error).
+    resp = client.delete("/transcripts/42?tenant_id=t1")
+    assert resp.status_code == 204
+    assert resp.data == b""
+
+
 def test_first_transcript_returns_lowest_chunk(client, ts):
     _seed(ts, "t1", {"100": "a", "500": "b", "900": "c"})
     resp = client.get("/transcripts/first?tenant_id=t1")
     assert resp.status_code == 200
     assert resp.get_json() == {"chunk_id": "100", "transcript": "a"}
+
+
+def test_first_transcript_returns_204_when_empty(client):
+    resp = client.get("/transcripts/first?tenant_id=does-not-exist")
+    assert resp.status_code == 204
+    assert resp.data == b""
+
+
+def test_first_transcript_delete_returns_204_when_empty(client):
+    resp = client.delete("/transcripts/first?tenant_id=does-not-exist")
+    assert resp.status_code == 204
+    assert resp.data == b""
+
+
+def test_first_transcript_returns_204_when_from_filter_excludes_all(client, ts):
+    _seed(ts, "t1", {"100": "a", "200": "b"})
+    resp = client.get("/transcripts/first?tenant_id=t1&from=9999")
+    assert resp.status_code == 204
+    assert resp.data == b""
 
 
 def test_first_transcript_delete_pops_lowest_chunk(client, ts):
@@ -147,6 +204,18 @@ def test_latest_transcript_returns_highest_chunk(client, ts):
     resp = client.get("/transcripts/latest?tenant_id=t1")
     assert resp.status_code == 200
     assert resp.get_json() == {"chunk_id": "900", "transcript": "c"}
+
+
+def test_latest_transcript_returns_204_when_empty(client):
+    resp = client.get("/transcripts/latest?tenant_id=does-not-exist")
+    assert resp.status_code == 204
+    assert resp.data == b""
+
+
+def test_latest_transcript_delete_returns_204_when_empty(client):
+    resp = client.delete("/transcripts/latest?tenant_id=does-not-exist")
+    assert resp.status_code == 204
+    assert resp.data == b""
 
 
 def test_transcripts_count_counts_within_range(client, ts):
