@@ -33,23 +33,20 @@ disable_toc: true
     pollingInProgress = true;  // Set flag indicating polling has started
 
     const tenant_id = document.getElementById('tenant_id').value;
-    let get_latest_transcript_url = `/api/get_latest_transcript?tenant_id=${tenant_id}`;
+    let transcripts_url = `/api/transcripts?tenant_id=${tenant_id}`;
 
-    fetch(get_latest_transcript_url)
+    fetch(transcripts_url)
       .then(response => response.json())
       .then(data => {
-        // data is a dictionary with keys: chunk_id and objects with attributes: transcript, translated
-        // iterate over the keys to get the data
-        // console.log(data);
+        // GET /api/transcripts returns { "transcripts": [ { chunk_id, transcript }, ... ] }.
+        // Iterate over the array, creating/updating one div per chunk_id.
+        const transcripts = data.transcripts || [];
+        for (let i = 0; i < transcripts.length; i++) {
+          const chunk_id = String(transcripts[i].chunk_id);
+          const transcript = transcripts[i].transcript;
 
-        chunk_ids = Object.keys(data);
-        for (i = 0; i < chunk_ids.length; i++) {
-          chunk_id = chunk_ids[i];
-          transcript_event = data[chunk_id]
-          transcript = transcript_event.transcript;
-          
           // find the div with the chunk_id
-          div = document.getElementById(chunk_id);
+          let div = document.getElementById(chunk_id);
           if (div === null) {
             // New chunk ID, add a new line to the transcript container
             const newLine = document.createElement('div');
@@ -65,7 +62,7 @@ disable_toc: true
         // Scroll to the bottom of the transcript container
         transcriptContainer.scrollTop = transcriptContainer.scrollHeight;
       })
-      .catch(error => console.error('Error fetching latest transcript:', error))
+      .catch(error => console.error('Error fetching transcripts:', error))
       .finally(() => {
         pollingInProgress = false;  // Reset the flag once the polling is done
 
